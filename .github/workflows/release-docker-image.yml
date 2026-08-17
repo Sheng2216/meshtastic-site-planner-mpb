@@ -1,0 +1,135 @@
+# Manual-only release of a linux/arm64 Docker image tarball for MPB / Pi.
+# Does not replace ci.yml or deploy.yml.
+#
+# Why this does not `docker build -f Dockerfile`:
+# The upstream Dockerfile runs `corepack enable` then `pnpm install` *inside*
+# the image. GitHub Actions' pnpm 9 pin (ci.yml / this workflow) only applies
+# on the runner, not inside that build stage. Current node:22-alpine Corepack
+# defaults to pnpm 11, which does not read package.json#pnpm.overrides and
+# fails --frozen-lockfile against this lockfile.
+#
+# Instead we reuse the upstream *runtime* half unchanged:
+#   FROM nginx:alpine
+#   COPY dist /usr/share/nginx/html
+#   EXPOSE 80
+# and build `dist/` on the runner with the same pnpm 9 pin as ci.yml.
+# The committed Dockerfile is not modified.
+
+name: Release Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release / image tag. Empty = <UTC-date>-<shortsha>-mpb"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-arm64-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        run: pnpm build
+        env:
+          VITE_STADIA_API_KEY: ${{ secrets.STADIA_API_KEY }}
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          date_utc="$(date -u +%Y.%m.%d)"
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${date_utc}-${short_sha}-mpb"
+          fi
+          if [[ ! "$tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid tag: $tag" >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=meshtastic-site-planner-app:${tag}" >> "$GITHUB_OUTPUT"
+          echo "asset=meshtastic-site-planner-app-${tag}-linux-arm64.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/arm64 image
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'FROM nginx:alpine' \
+            'COPY dist /usr/share/nginx/html' \
+            'EXPOSE 80' \
+            > /tmp/Dockerfile.runtime
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            -f /tmp/Dockerfile.runtime \
+            -t "${{ steps.meta.outputs.image }}" \
+            .
+
+      - name: Save image tarball
+        run: |
+          set -euo pipefail
+          docker image inspect "${{ steps.meta.outputs.image }}" \
+            --format '{{.Os}}/{{.Architecture}} {{.Id}}'
+          docker image save "${{ steps.meta.outputs.image }}" \
+            | gzip -n > "${{ steps.meta.outputs.asset }}"
+          shasum -a 256 "${{ steps.meta.outputs.asset }}" \
+            | tee "${{ steps.meta.outputs.asset }}.sha256"
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect "${{ steps.meta.outputs.image }}" --format '{{.Id}}')"
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "Site Planner ${{ steps.meta.outputs.tag }}" \
+            --notes "$(cat <<EOF
+          linux/arm64 Docker image for MPB / Raspberry Pi.
+
+          - Source commit: \`${{ steps.meta.outputs.commit }}\`
+          - Image: \`${{ steps.meta.outputs.image }}\`
+          - Image ID: \`${image_id}\`
+          - Runtime: \`nginx:alpine\`, container port 80 (same as the upstream Dockerfile final stage)
+
+          Load on the Pi:
+
+          \`\`\`bash
+          gzip -dc ${{ steps.meta.outputs.asset }} | docker image load
+          \`\`\`
+          EOF
+          )" \
+            "${{ steps.meta.outputs.asset }}" \
+            "${{ steps.meta.outputs.asset }}.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}
