@@ -110,13 +110,15 @@ jobs:
           image="${{ steps.meta.outputs.image }}"
           asset="${{ steps.meta.outputs.asset }}"
           docker image save "$image" | gzip -n > "$asset"
-          # Record the ID after a save/load round-trip. That is the value
-          # `docker image inspect` reports on the Pi after docker load.
           docker image rm -f "$image"
           gzip -dc "$asset" | docker image load
-          image_id="$(docker image inspect "$image" --format '{{.Id}}')"
           image_arch="$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')"
           [[ "$image_arch" == "linux/arm64" ]]
+          # GitHub-hosted Docker reports the image *config* digest as .Id.
+          # Raspberry Pi Docker reports the OCI *manifest* digest as .Id after
+          # docker load. Publish the digest from the tarball index so it
+          # matches `docker image inspect` on the Pi.
+          image_id="$(python3 -c 'import gzip,json,sys,tarfile; tar=tarfile.open(fileobj=gzip.open(sys.argv[1],"rb")); digest=json.load(tar.extractfile("index.json"))["manifests"][0]["digest"]; assert str(digest).startswith("sha256:"); print(digest)' "$asset")"
           echo "id=$image_id" >> "$GITHUB_OUTPUT"
           echo "$image_arch $image_id"
           shasum -a 256 "$asset" | tee "${asset}.sha256"
