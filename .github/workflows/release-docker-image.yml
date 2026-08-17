@@ -91,27 +91,40 @@ jobs:
             'COPY dist /usr/share/nginx/html' \
             'EXPOSE 80' \
             > /tmp/Dockerfile.runtime
+          # Default buildx provenance/SBOM wraps the result in an OCI index.
+          # docker image inspect then reports that index ID, but docker save/
+          # load on a Pi classic store unwraps to the platform image ID.
           docker buildx build \
             --platform linux/arm64 \
+            --provenance=false \
+            --sbom=false \
             --load \
             -f /tmp/Dockerfile.runtime \
             -t "${{ steps.meta.outputs.image }}" \
             .
 
       - name: Save image tarball
+        id: image
         run: |
           set -euo pipefail
-          docker image inspect "${{ steps.meta.outputs.image }}" \
-            --format '{{.Os}}/{{.Architecture}} {{.Id}}'
-          docker image save "${{ steps.meta.outputs.image }}" \
-            | gzip -n > "${{ steps.meta.outputs.asset }}"
-          shasum -a 256 "${{ steps.meta.outputs.asset }}" \
-            | tee "${{ steps.meta.outputs.asset }}.sha256"
+          image="${{ steps.meta.outputs.image }}"
+          asset="${{ steps.meta.outputs.asset }}"
+          docker image save "$image" | gzip -n > "$asset"
+          # Record the ID after a save/load round-trip. That is the value
+          # `docker image inspect` reports on the Pi after docker load.
+          docker image rm -f "$image"
+          gzip -dc "$asset" | docker image load
+          image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+          image_arch="$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')"
+          [[ "$image_arch" == "linux/arm64" ]]
+          echo "id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "$image_arch $image_id"
+          shasum -a 256 "$asset" | tee "${asset}.sha256"
 
       - name: Publish GitHub Release
         run: |
           set -euo pipefail
-          image_id="$(docker image inspect "${{ steps.meta.outputs.image }}" --format '{{.Id}}')"
+          image_id="${{ steps.image.outputs.id }}"
           gh release create "${{ steps.meta.outputs.tag }}" \
             --title "Site Planner ${{ steps.meta.outputs.tag }}" \
             --notes "$(cat <<EOF
